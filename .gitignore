@@ -1,13 +1,16 @@
 # Python
 __pycache__/
 *.pyc
+.pytest_cache/
 
-# Env
+# Env / secrets
 venv/
 .env
 .env.local
 
-# Logs
+# Bot runtime files
+data/
+STOP
 *.log
 
 # OS

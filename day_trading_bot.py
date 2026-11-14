@@ -1,435 +1,323 @@
 #!/usr/bin/env python3
 """
-CoinDCX INR Day-Trading Bot (EMA + RSI, 15m)
+CoinDCX INR Spot Bot v2 — EMA crossover + trend + RSI filter, risk-sized,
+with bot-managed stop-loss and target.
 
-SAFE TESTING INSTRUCTIONS:
-- Keep DRY_RUN = True to prevent any real orders.
-- Run `auth_test.py` (provided separately) with your API credentials to verify authentication first.
-- When ready, set DRY_RUN = False to place real orders. Use at your own risk.
-- Create a file named STOP in the working directory to gracefully stop the bot.
+Paper trading by default (no API keys needed). Live trading needs BOTH:
+    export DRY_RUN=false
+    export CONFIRM_LIVE=YES
+Create a file named STOP in the working directory to stop gracefully.
 
-SETUP:
-- Python 3.12+, `pip install requests numpy`
-- Fill API_KEY and API_SECRET placeholders below OR use environment variables:
-  COINDCX_API_KEY / COINDCX_API_SECRET
-
-NOTES:
-- Spot trading only
-- Uses exact signed compact JSON string for private endpoints (per CoinDCX spec)
+IMPORTANT: CoinDCX INR markets have no stop orders, so stops are checked by
+this bot every MONITOR_INTERVAL_SEC. If the bot is not running, open positions
+have NO stop. Run it under systemd/tmux and monitor it.
 """
 
+from __future__ import annotations
+
+import csv
+import logging
 import os
-import time
-import json
-import hmac
-import hashlib
-import random
-import requests
-import numpy as np
-from typing import List, Dict, Any, Optional, Tuple
 import sys
+import time
+from datetime import datetime
+from typing import Dict, List, Optional
+from zoneinfo import ZoneInfo
 
-# =====================================================================
-# CONFIGURATION
-# =====================================================================
-API_KEY = ""  # set later, or use environment variable COINDCX_API_KEY
-API_SECRET = ""  # set later, or use environment variable COINDCX_API_SECRET
-BASE_URL = "https://api.coindcx.com"
-PUBLIC_BASE_URL = "https://public.coindcx.com"
-INTERVAL = "15m"
-DRY_RUN = True  # True = no real trading, False = place orders
-MAX_OPEN_TRADES = 3
-GLOBAL_EXPOSURE_LIMIT = 0.40  # max 40% of INR balance in open holdings
-SLEEP_BETWEEN_COINS_SEC = 1.5
-FULL_CYCLE_SLEEP_SEC = 900  # 15 minutes
-STOP_FILE = "STOP"
-SHOW_DASHBOARD = True
+import config as cfg
+import strategy as st
+from broker import LiveBroker, PaperBroker
+from coindcx_client import CoinDCXClient, CoinDCXError
+from risk import (Position, RiskState, account_gate, market_gate, record_close,
+                  roll_day, size_position)
 
-# Watchlist of INR spot markets
-WATCHLIST = [
-    "BTCINR", "ETHINR", "SOLINR",
-    "BNBINR", "XRPINR", "DOGEINR",
-    "AVAXINR", "LINKINR", "DOTINR",
-    "SUIINR", "NEARINR", "APTINR",
-    "PEPEINR", "WIFINR",
-]
+IST = ZoneInfo("Asia/Kolkata")
+LIVE = cfg.is_live()
+MODE = "LIVE" if LIVE else "PAPER"
+os.makedirs(cfg.DATA_DIR, exist_ok=True)
+STATE_PATH = os.path.join(cfg.DATA_DIR, f"state_{MODE.lower()}.json")
+TRADES_CSV = os.path.join(cfg.DATA_DIR, f"trades_{MODE.lower()}.csv")
 
-# =====================================================================
-# UTILS / LOGGING
-# =====================================================================
-def now_ts() -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[logging.FileHandler(os.path.join(cfg.DATA_DIR, "bot.log"), encoding="utf-8"),
+              logging.StreamHandler(sys.stdout)],
+)
+_logger = logging.getLogger("bot")
+
 
 def log(msg: str) -> None:
-    print(f"[{now_ts()}] {msg}")
+    _logger.info(f"[{MODE}] {msg}")
 
-def get_env(key: str, default: str = "") -> str:
-    return os.environ.get(key, default)
 
-def get_credentials() -> Tuple[str, str]:
-    key = API_KEY or get_env("COINDCX_API_KEY", "")
-    secret = API_SECRET or get_env("COINDCX_API_SECRET", "")
-    return key, secret
+def now_ist() -> datetime:
+    return datetime.now(IST)
 
-# =====================================================================
-# SIGNING / PRIVATE POST (exact compact JSON)
-# =====================================================================
-def sign_request(body: Dict[str, Any], secret: str) -> str:
-    payload = json.dumps(body, separators=(",", ":"))
-    return hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
 
-def authenticated_post(endpoint: str, body: Dict[str, Any]) -> Dict[str, Any]:
-    key, secret = get_credentials()
-    if not key or not secret:
-        raise RuntimeError("Missing COINDCX_API_KEY / COINDCX_API_SECRET")
-    body = dict(body)
-    body["timestamp"] = int(time.time() * 1000)
-    sig = sign_request(body, secret)
-    headers = {
-        "Content-Type": "application/json",
-        "X-AUTH-APIKEY": key,
-        "X-AUTH-SIGNATURE": sig,
-    }
-    payload = json.dumps(body, separators=(",", ":"))
-    r = requests.post(BASE_URL + endpoint, data=payload, headers=headers, timeout=15)
-    if r.status_code >= 400:
-        log(f"HTTP {r.status_code}: {r.text.strip()}")
-        r.raise_for_status()
-    return r.json()
+def fmt_price(p: float) -> str:
+    """Enough decimals for cheap coins (PEPE) without clutter for BTC."""
+    if p >= 1000:
+        return f"{p:,.2f}"
+    if p >= 1:
+        return f"{p:,.4f}"
+    return f"{p:.8f}".rstrip("0")
 
-# =====================================================================
-# PUBLIC DATA HELPERS
-# =====================================================================
-def get_candles(pair: str, interval: str = INTERVAL, limit: int = 100) -> List[Any]:
-    params = {"pair": pair, "interval": interval, "limit": limit}
-    r = requests.get(PUBLIC_BASE_URL + "/market_data/candles", params=params, timeout=15)
-    r.raise_for_status()
-    return r.json()
 
-def extract_closes(candles: List[Any]) -> List[float]:
-    closes: List[float] = []
-    for c in candles:
-        v = None
-        if isinstance(c, dict):
-            v = c.get("close")
-        elif isinstance(c, (list, tuple)) and len(c) >= 5:
-            v = c[4]
-        if v is None:
-            continue
-        try:
-            closes.append(float(v))
-        except Exception:
-            continue
-    return closes
+def write_trade(row: Dict) -> None:
+    new = not os.path.exists(TRADES_CSV)
+    with open(TRADES_CSV, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["time", "mode", "market", "side", "qty", "price",
+                                          "fee", "pnl", "reason"])
+        if new:
+            w.writeheader()
+        w.writerow(row)
 
-def get_market_details(market: str) -> Optional[Dict[str, Any]]:
-    r = requests.get(BASE_URL + "/exchange/v1/markets_details", timeout=15)
-    r.raise_for_status()
-    markets = r.json()
-    for m in markets:
-        if m.get("coindcx_name") == market:
-            return m
-    return None
 
-def market_to_public_pair(details: Dict[str, Any]) -> Optional[str]:
-    return details.get("pair")
+# ── Bot ────────────────────────────────────────────────────────────────────
+class Bot:
+    def __init__(self):
+        self.client = CoinDCXClient(cfg.API_KEY, cfg.API_SECRET, cfg.BASE_URL,
+                                    cfg.PUBLIC_BASE_URL, cfg.HTTP_TIMEOUT_SEC)
+        self.state = RiskState.load(STATE_PATH)
+        self.broker = (LiveBroker(self.client, self.state, cfg, log) if LIVE
+                       else PaperBroker(self.state, cfg, log))
+        self.tickers: Dict[str, dict] = {}
+        self.rows: List[Dict[str, str]] = []
+        self._unmanaged_logged = False
 
-# =====================================================================
-# AUTH / ACCOUNT HELPERS
-# =====================================================================
-def get_balances() -> List[Dict[str, Any]]:
-    return authenticated_post("/exchange/v1/users/balances", {})
+    # helpers ---------------------------------------------------------------
+    def refresh_tickers(self) -> Dict[str, dict]:
+        self.tickers = self.client.tickers()
+        return self.tickers
 
-def get_active_orders(market: str) -> List[Dict[str, Any]]:
-    res = authenticated_post("/exchange/v1/orders/active_orders", {"market": market})
-    if isinstance(res, dict) and "orders" in res:
-        return res.get("orders") or []
-    if isinstance(res, list):
-        return res
-    return []
+    def details(self, market: str) -> Optional[dict]:
+        return self.client.markets().get(market)
 
-# =====================================================================
-# INDICATORS
-# =====================================================================
-def calculate_ema(prices: List[float], period: int) -> Optional[List[float]]:
-    if len(prices) < period:
-        return None
-    ema = float(np.mean(prices[:period]))
-    multiplier = 2 / (period + 1)
-    emas = [ema]
-    for price in prices[period:]:
-        ema = (price - ema) * multiplier + ema
-        emas.append(ema)
-    return emas
+    def save(self) -> None:
+        self.state.save(STATE_PATH)
 
-def calculate_rsi(prices: List[float], period: int = 14) -> Optional[List[float]]:
-    if len(prices) <= period:
-        return None
-    deltas = np.diff(prices)
-    gains = np.where(deltas > 0, deltas, 0)
-    losses = np.where(deltas < 0, -deltas, 0)
-    avg_gain = float(np.mean(gains[:period]))
-    avg_loss = float(np.mean(losses[:period]))
-    rs = avg_gain / avg_loss if avg_loss != 0 else 0
-    rsi_values = [100 - (100 / (1 + rs))]
-    for i in range(period, len(deltas)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-        rs = avg_gain / avg_loss if avg_loss != 0 else 0
-        rsi_values.append(100 - (100 / (1 + rs)))
-    return rsi_values
+    # startup ---------------------------------------------------------------
+    def startup(self) -> bool:
+        log(f"Starting v2 | interval {cfg.INTERVAL} | {len(cfg.WATCHLIST)} markets | state {STATE_PATH}")
+        if not cfg.DRY_RUN and not LIVE:
+            log("DRY_RUN=false but CONFIRM_LIVE is not 'YES' → staying in PAPER mode")
+        if LIVE:
+            try:
+                self.client.balances()
+                log("Auth OK")
+            except CoinDCXError as e:
+                log(f"Auth failed: {e}")
+                return False
+            self.reconcile()
+        self.refresh_tickers()
+        markets = self.client.markets()
+        for m in cfg.WATCHLIST:
+            d = markets.get(m)
+            if not d:
+                log(f"{m}: not listed on CoinDCX → ignored")
+            elif d.get("status") != "active":
+                log(f"{m}: status {d.get('status')} → ignored")
+        return True
 
-# =====================================================================
-# ORDER HELPERS
-# =====================================================================
-def adjust_quantity(qty: float, min_qty: float, precision: int) -> float:
-    step = 10 ** (-precision)
-    adj = max(min_qty, round(qty - (qty % step), precision))
-    return adj
+    def reconcile(self) -> None:
+        """Drop positions that no longer exist on the exchange (sold manually)."""
+        bals = self.client.balances()
+        for m, p in list(self.state.positions.items()):
+            d = self.details(m) or {}
+            held = bals.get(m[:-3], {}).get("total", 0.0)
+            if held < max(float(d.get("min_quantity", 0) or 0), p.qty * 0.5):
+                log(f"{m}: position in state but only {held} held on exchange → removed from state")
+                del self.state.positions[m]
+            elif held < p.qty:
+                p.qty = held
+        managed = set(self.state.positions)
+        unmanaged = [c for c, b in bals.items()
+                     if c != "INR" and b["total"] > 0 and f"{c}INR" in cfg.WATCHLIST
+                     and f"{c}INR" not in managed]
+        if unmanaged and not self._unmanaged_logged:
+            log(f"Holdings NOT managed by the bot (left untouched): {', '.join(unmanaged)}")
+            self._unmanaged_logged = True
+        self.save()
 
-def place_market_order(side: str, market: str, total_quantity: float) -> Dict[str, Any]:
-    body = {
-        "side": side,
-        "order_type": "market_order",
-        "market": market,
-        "total_quantity": total_quantity,
-    }
-    if DRY_RUN:
-        log(f"DRY_RUN: would place {side} market on {market} qty {total_quantity}")
-        return {"status": "simulated", "orders": [{"avg_price": None}]}
-    return authenticated_post("/exchange/v1/orders/create", body)
+    # exits -----------------------------------------------------------------
+    def close_position(self, market: str, reason: str) -> None:
+        p = self.state.positions.get(market)
+        d = self.details(market)
+        if not p or not d:
+            return
+        fill = self.broker.sell(market, p.qty, self.refresh_tickers, d)
+        if not fill:
+            log(f"{market}: EXIT FAILED ({reason}); will retry next check")
+            return
+        pnl = (fill.avg_price - p.entry) * fill.qty - fill.fee - p.entry_fee * (fill.qty / p.qty)
+        today = now_ist().date()
+        if fill.qty < p.qty * 0.999:
+            p.entry_fee *= 1 - fill.qty / p.qty
+            p.qty -= fill.qty
+            log(f"{market}: partial exit {fill.qty}, {p.qty} left")
+        else:
+            del self.state.positions[market]
+        record_close(self.state, pnl, today, cfg)
+        write_trade({"time": now_ist().isoformat(timespec="seconds"), "mode": MODE,
+                     "market": market, "side": "sell", "qty": fill.qty,
+                     "price": fill.avg_price, "fee": round(fill.fee, 2),
+                     "pnl": round(pnl, 2), "reason": reason})
+        log(f"{market}: EXIT {reason} {fill.qty} @ ₹{fill.avg_price:,.4f} | P&L ₹{pnl:,.2f} "
+            f"| streak {self.state.loss_streak} | today ₹{self.state.realized_pnl_today:,.2f}")
+        if self.state.cooldown_until:
+            log(f"Cooldown active until {self.state.cooldown_until}")
+        self.save()
 
-def place_stop_loss(market: str, qty: float, stop_price: float, limit_price: float) -> Dict[str, Any]:
-    body = {
-        "side": "sell",
-        "order_type": "stop_limit",
-        "market": market,
-        "price_per_unit": limit_price,
-        "total_quantity": qty,
-        "stop_price": stop_price,
-    }
-    if DRY_RUN:
-        log(f"DRY_RUN: would place stop-limit on {market} qty {qty} stop {stop_price:.2f} limit {limit_price:.2f}")
-        return {"status": "simulated"}
-    return authenticated_post("/exchange/v1/orders/create", body)
+    def check_stops(self) -> None:
+        if not self.state.positions:
+            return
+        tickers = self.refresh_tickers()
+        for m, p in list(self.state.positions.items()):
+            t = tickers.get(m)
+            if not t or not t.get("bid"):
+                continue
+            bid = float(t["bid"])
+            if bid <= p.stop:
+                self.close_position(m, f"STOP (bid {bid} ≤ {p.stop:.4f})")
+            elif bid >= p.target:
+                self.close_position(m, f"TARGET (bid {bid} ≥ {p.target:.4f})")
 
-def color(text: str, fg: Optional[str] = None, bold: bool = False) -> str:
-    codes = []
-    if bold:
-        codes.append("1")
-    if fg == "red":
-        codes.append("31")
-    elif fg == "green":
-        codes.append("32")
-    elif fg == "yellow":
-        codes.append("33")
-    elif fg == "blue":
-        codes.append("34")
-    elif fg == "magenta":
-        codes.append("35")
-    elif fg == "cyan":
-        codes.append("36")
-    elif fg == "gray":
-        codes.append("90")
-    if not codes:
-        return text
-    return f"\033[{';'.join(codes)}m{text}\033[0m"
+    # entries ---------------------------------------------------------------
+    def evaluate(self) -> None:
+        now = now_ist()
+        now_ms = int(time.time() * 1000)
+        tickers = self.refresh_tickers()
+        equity, avail_inr, exposure = self.broker.account(tickers)
+        roll_day(self.state, now.date(), equity)
+        if LIVE:
+            self.reconcile()
+        log(f"Equity ₹{equity:,.2f} | free INR ₹{avail_inr:,.2f} | in coins ₹{exposure:,.2f} "
+            f"| open {len(self.state.positions)} | trades today {self.state.trades_today}")
+        self.rows = []
+        markets = self.client.markets()
 
-def render_dashboard(rows: List[Dict[str, str]], exposure_pct: float, open_orders: int, next_time_str: str) -> None:
-    headers = ["Market", "Price", "EMA12", "EMA26", "RSI", "Hold", "Signal", "Reason"]
-    widths = [10, 16, 14, 14, 7, 6, 8, 52]
-    total_width = sum(widths) + len(widths) + 1
-    sys.stdout.write("\033[2J\033[H")
-    title = " CoinDCX INR Day-Trading Bot • 15m • EMA+RSI "
-    banner = "╔" + "═" * (total_width - 2) + "╗"
-    print(color(banner, fg="cyan", bold=True))
-    print(color("║" + title.center(total_width - 2) + "║", fg="cyan", bold=True))
-    print(color("╠" + "═" * (total_width - 2) + "╣", fg="cyan", bold=True))
-    header_line = "║"
-    for h, w in zip(headers, widths):
-        header_line += color(h.center(w), fg="gray", bold=True) + "│"
-    header_line = header_line[:-1] + "║"
-    print(header_line)
-    print(color("╟" + "─" * (total_width - 2) + "╢", fg="gray"))
-    for r in rows:
-        try:
-            rsi_val = float(r["rsi"])
-        except Exception:
-            rsi_val = 0.0
-        rsi_col = "green" if rsi_val < 30 else ("red" if rsi_val > 70 else "yellow")
-        sig_txt = r["sig"]
-        line = "║"
-        line += r["market"].ljust(widths[0]) + "│"
-        line += r["price"].rjust(widths[1]) + "│"
-        line += r["ema12"].rjust(widths[2]) + "│"
-        line += r["ema26"].rjust(widths[3]) + "│"
-        line += color(r["rsi"].rjust(widths[4]), fg=rsi_col, bold=True) + "│"
-        line += (color(r["hold"].center(widths[5]), fg="green", bold=True) if r["hold"] == "Y" else color(r["hold"].center(widths[5]), fg="red", bold=True)) + "│"
-        line += sig_txt.center(widths[6]) + "│"
-        line += r["reason"][:widths[7]].ljust(widths[7]) + "║"
-        print(line)
-    print(color("╠" + "═" * (total_width - 2) + "╣", fg="cyan", bold=True))
-    status = f"Open orders: {open_orders} • Exposure: {exposure_pct*100:.1f}% • Next: {next_time_str}"
-    status_color = "green" if exposure_pct <= GLOBAL_EXPOSURE_LIMIT else "red"
-    print(color("║" + status.center(total_width - 2) + "║", fg=status_color, bold=True))
-    print(color("╚" + "═" * (total_width - 2) + "╝", fg="cyan", bold=True))
+        for market in cfg.WATCHLIST:
+            d = markets.get(market)
+            if not d or d.get("status") != "active":
+                continue
+            try:
+                raw = self.client.candles(d["pair"], cfg.INTERVAL, cfg.CANDLE_LIMIT)
+            except CoinDCXError as e:
+                log(f"{market}: candles failed ({e})")
+                continue
+            candles = st.normalize_candles(raw, cfg.INTERVAL, now_ms)
+            ind_all = st.compute_indicators(candles, cfg)
+            ind = ind_all[-1] if ind_all else None
+            pos = self.state.positions.get(market)
+            signal = "-"
 
-# =====================================================================
-# MAIN LOOP
-# =====================================================================
-def run():
-    log("Starting CoinDCX 15m EMA+RSI Day-Trading Bot (SPOT, INR)")
-    try:
-        _ = get_balances()
-        log("Auth OK")
-    except Exception as e:
-        log(f"Auth failed: {e}")
-        return
+            if pos and st.exit_on_signal(ind, cfg):
+                signal = "EXIT"
+                self.close_position(market, "EMA bear cross")
+            elif not pos:
+                sig = st.entry_signal(ind, cfg)
+                if sig:
+                    signal = "BUY?"
+                    ok, why = account_gate(self.state, now.date(), cfg)
+                    if ok:
+                        self.try_enter(market, d, sig, equity, avail_inr, exposure)
+                        equity, avail_inr, exposure = self.broker.account(self.refresh_tickers())
+                    else:
+                        log(f"{market}: entry signal but blocked → {why}")
+            self.rows.append({
+                "market": market,
+                "price": fmt_price(ind.close) if ind else "-",
+                "rsi": f"{ind.rsi:.1f}" if ind else "-",
+                "hold": "Y" if market in self.state.positions else "N",
+                "sig": signal,
+                "reason": st.describe(ind, cfg),
+            })
+            time.sleep(0.3)
+        self.save()
 
-    while True:
-        try:
-            if os.path.exists(STOP_FILE):
-                log("STOP file found; exiting gracefully")
+    def try_enter(self, market: str, d: dict, sig: st.EntrySignal,
+                  equity: float, avail_inr: float, exposure: float) -> None:
+        t = self.tickers.get(market)
+        if not t or not t.get("ask"):
+            log(f"{market}: no ask price → skip")
+            return
+        ask = float(t["ask"])
+        risk_dist = sig.entry_ref - sig.stop
+        stop = ask - risk_dist
+        qty, note = size_position(equity, avail_inr, ask, stop, cfg,
+                                  float(d.get("min_quantity", 0) or 0),
+                                  int(d.get("target_currency_precision", 6)))
+        if qty <= 0:
+            log(f"{market}: signal skipped → {note}")
+            return
+        ok, why = market_gate(self.state, market, equity, exposure, qty * ask, cfg)
+        if not ok:
+            log(f"{market}: signal skipped → {why}")
+            return
+        log(f"{market}: BUY {qty} @ ~₹{ask:,.4f} ({note}) | {sig.reason}")
+        fill = self.broker.buy(market, qty, t, d)
+        if not fill:
+            log(f"{market}: buy not filled")
+            return
+        self.state.positions[market] = Position(
+            market=market, qty=fill.qty, entry=fill.avg_price,
+            stop=fill.avg_price - risk_dist,
+            target=fill.avg_price + cfg.TARGET_R * risk_dist,
+            opened_at=now_ist().isoformat(timespec="seconds"), entry_fee=fill.fee)
+        self.state.trades_today += 1
+        p = self.state.positions[market]
+        write_trade({"time": p.opened_at, "mode": MODE, "market": market, "side": "buy",
+                     "qty": fill.qty, "price": fill.avg_price, "fee": round(fill.fee, 2),
+                     "pnl": "", "reason": sig.reason})
+        log(f"{market}: OPEN {fill.qty} @ ₹{fill.avg_price:,.4f} | stop ₹{p.stop:,.4f} "
+            f"| target ₹{p.target:,.4f}")
+        self.save()
+
+    # dashboard -------------------------------------------------------------
+    def dashboard(self, next_eval: float) -> None:
+        if not cfg.SHOW_DASHBOARD or not self.rows:
+            return
+        print("\n" + f" CoinDCX v2 • {MODE} • {cfg.INTERVAL} ".center(78, "═"))
+        print(f"{'Market':10}{'Price':>16}{'RSI':>7}{'Hold':>6}{'Signal':>8}  Reason")
+        for r in self.rows:
+            print(f"{r['market']:10}{r['price']:>16}{r['rsi']:>7}{r['hold']:>6}{r['sig']:>8}  {r['reason']}")
+        for m, p in self.state.positions.items():
+            print(f"  • {m}: {p.qty} @ {fmt_price(p.entry)} | stop {fmt_price(p.stop)} "
+                  f"| target {fmt_price(p.target)}")
+        nxt = datetime.fromtimestamp(next_eval, IST).strftime("%H:%M:%S")
+        print(f" P&L today ₹{self.state.realized_pnl_today:,.2f} • total ₹{self.state.realized_pnl_total:,.2f}"
+              f" • next signal check {nxt} IST ".center(78, "═"))
+
+    # main loop -------------------------------------------------------------
+    def next_eval_time(self) -> float:
+        step = st.INTERVAL_MS[cfg.INTERVAL] / 1000
+        return (time.time() // step + 1) * step + cfg.CANDLE_CLOSE_DELAY_SEC
+
+    def run(self) -> None:
+        if not self.startup():
+            return
+        next_eval = time.time()            # evaluate once immediately
+        while True:
+            try:
+                if os.path.exists(cfg.STOP_FILE):
+                    log("STOP file found → exiting. Open positions are NOT protected while stopped!")
+                    break
+                if time.time() >= next_eval:
+                    self.evaluate()
+                    next_eval = self.next_eval_time()
+                    self.dashboard(next_eval)
+                self.check_stops()
+                time.sleep(cfg.MONITOR_INTERVAL_SEC)
+            except KeyboardInterrupt:
+                log("Interrupted → exiting. Open positions are NOT protected while stopped!")
                 break
+            except Exception as e:                       # keep running, but say why
+                _logger.exception(f"[{MODE}] loop error: {e}")
+                time.sleep(60)
+        self.save()
 
-            balances = get_balances()
-            inr_balance = float(next((b["balance"] for b in balances if b["currency"] == "INR"), 0.0))
-            currency_bal = {b["currency"]: float(b["balance"]) for b in balances}
-
-            total_open_orders = 0
-            total_holding_value_inr = 0.0
-            table_rows: List[Dict[str, str]] = []
-
-            log(f"Account INR balance ₹{inr_balance:,.2f}")
-
-            for market in WATCHLIST:
-                time.sleep(SLEEP_BETWEEN_COINS_SEC)
-                details = get_market_details(market)
-                if not details:
-                    log(f"{market}: market details not found; skipping")
-                    continue
-
-                min_qty = float(details.get("min_quantity", 0.0))
-                target_precision = int(details.get("target_currency_precision", 6))
-                public_pair = market_to_public_pair(details)
-                if not public_pair:
-                    log(f"{market}: public pair not available; skipping")
-                    continue
-                step_qty = 10 ** (-target_precision)
-                effective_min_qty = max(min_qty, step_qty)
-
-                active_orders = get_active_orders(market)
-                total_open_orders += len(active_orders)
-
-                candles = get_candles(public_pair, INTERVAL, limit=100)
-                closes = extract_closes(candles)
-                if len(closes) < 40:
-                    log(f"{market}: insufficient candle data ({len(closes)})")
-                    continue
-                current_price = float(closes[-1])
-                if current_price <= 0:
-                    log(f"{market}: invalid current price ({current_price}) → skipping")
-                    continue
-
-                symbol = market.replace("INR", "")
-                holding_qty = currency_bal.get(symbol, 0.0)
-                total_holding_value_inr += holding_qty * current_price
-
-                ema12_series = calculate_ema(closes, 12)
-                ema26_series = calculate_ema(closes, 26)
-                rsi_series = calculate_rsi(closes, 14)
-                if not ema12_series or not ema26_series or not rsi_series:
-                    log(f"{market}: indicator series not available")
-                    continue
-
-                ema12 = float(ema12_series[-1])
-                ema26 = float(ema26_series[-1])
-                rsi14 = float(rsi_series[-1])
-
-                prev_ema12 = float(ema12_series[-2]) if len(ema12_series) >= 2 else ema12
-                prev_ema26 = float(ema26_series[-2]) if len(ema26_series) >= 2 else ema26
-
-                not_holding = holding_qty < effective_min_qty
-                buy_signal = (prev_ema12 <= prev_ema26 and ema12 > ema26) and (rsi14 < 30) and not_holding
-                sell_signal = (prev_ema12 >= prev_ema26 and ema12 < ema26) and (rsi14 > 70) and (holding_qty >= effective_min_qty)
-
-                log(f"{market}: price ₹{current_price:,.2f} | EMA12 {ema12:.2f} / EMA26 {ema26:.2f} | RSI {rsi14:.1f} | holding {holding_qty:.8f}")
-
-                if buy_signal:
-                    if total_open_orders >= MAX_OPEN_TRADES:
-                        log(f"{market}: max open trades reached ({total_open_orders}) → skip buy")
-                        continue
-                    if total_holding_value_inr > GLOBAL_EXPOSURE_LIMIT * inr_balance:
-                        log(f"{market}: exposure {total_holding_value_inr:.2f} > {GLOBAL_EXPOSURE_LIMIT*100:.0f}% of INR {inr_balance:.2f} → skip buy")
-                        continue
-
-                    percent = random.uniform(0.05, 0.10)
-                    inr_to_use = inr_balance * percent
-                    qty = inr_to_use / current_price
-                    qty = adjust_quantity(qty, min_qty, target_precision)
-
-                    log(f"{market}: BUY signal → using {percent*100:.1f}% (₹{inr_to_use:,.2f}) → qty {qty:.8f}")
-                    buy_res = place_market_order("buy", market, qty)
-
-                    if not DRY_RUN and buy_res.get("status") == "filled":
-                        try:
-                            entry_price = float(buy_res["orders"][0]["avg_price"])
-                            stop_price = entry_price * 0.98
-                            limit_price = stop_price * 0.99
-                            _ = place_stop_loss(market, qty, stop_price, limit_price)
-                            log(f"{market}: stop-loss placed at ₹{stop_price:.2f}")
-                        except Exception as e:
-                            log(f"{market}: failed to place stop-loss → {e}")
-
-                elif sell_signal:
-                    qty = adjust_quantity(holding_qty, effective_min_qty, target_precision)
-                    if qty < effective_min_qty:
-                        log(f"{market}: sell qty below min ({qty:.8f} < {effective_min_qty:.8f}) → skip")
-                        continue
-                    log(f"{market}: SELL signal → qty {qty:.8f}")
-                    _ = place_market_order("sell", market, qty)
-                else:
-                    log(f"{market}: no trade | up {(prev_ema12 <= prev_ema26) and (ema12 > ema26)} | down {(prev_ema12 >= prev_ema26) and (ema12 < ema26)} | rsi<30 {rsi14 < 30} | rsi>70 {rsi14 > 70} | holding {holding_qty >= effective_min_qty}")
-                sig = "-"
-                sig_col = None
-                if buy_signal:
-                    sig = "BUY"
-                    sig_col = "green"
-                elif sell_signal:
-                    sig = "SELL"
-                    sig_col = "red"
-                up_ok = (prev_ema12 <= prev_ema26) and (ema12 > ema26)
-                dn_ok = (prev_ema12 >= prev_ema26) and (ema12 < ema26)
-                r_low = (rsi14 < 30)
-                r_high = (rsi14 > 70)
-                def mark(ok: bool) -> str:
-                    return color("✓", fg="green", bold=True) if ok else color("✗", fg="gray")
-                reason = f"↑ {mark(up_ok)} | ↓ {mark(dn_ok)} | RSI<30 {mark(r_low)} | RSI>70 {mark(r_high)}"
-                row = {
-                    "market": market,
-                    "price": f"{current_price:,.2f}",
-                    "ema12": f"{ema12:.2f}",
-                    "ema26": f"{ema26:.2f}",
-                    "rsi": f"{rsi14:.1f}",
-                    "hold": "Y" if holding_qty >= effective_min_qty else "N",
-                    "sig": color(sig, fg=sig_col, bold=True) if sig_col else sig,
-                    "reason": reason,
-                }
-                table_rows.append(row)
-
-            next_at = time.localtime(time.time() + FULL_CYCLE_SLEEP_SEC)
-            next_str = time.strftime("%H:%M:%S", next_at)
-            if SHOW_DASHBOARD:
-                render_dashboard(table_rows, (total_holding_value_inr / inr_balance) if inr_balance > 0 else 0.0, total_open_orders, next_str)
-            log(f"Full cycle done. Sleeping 15m → next at {next_str}")
-            time.sleep(FULL_CYCLE_SLEEP_SEC)
-
-        except KeyboardInterrupt:
-            log("Interrupted by user; exiting")
-            break
-        except Exception as e:
-            log(f"Error in main loop: {e}")
-            time.sleep(60)
 
 if __name__ == "__main__":
-    run()
+    Bot().run()
