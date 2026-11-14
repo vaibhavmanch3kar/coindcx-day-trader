@@ -219,10 +219,11 @@ class Bot:
             elif not pos:
                 sig = st.entry_signal(ind, cfg)
                 if sig:
-                    signal = "BUY?"
+                    signal = "SKIP"
                     ok, why = account_gate(self.state, now.date(), cfg)
                     if ok:
-                        self.try_enter(market, d, sig, equity, avail_inr, exposure)
+                        if self.try_enter(market, d, sig, equity, avail_inr, exposure):
+                            signal = "BUY"
                         equity, avail_inr, exposure = self.broker.account(self.refresh_tickers())
                     else:
                         log(f"{market}: entry signal but blocked → {why}")
@@ -238,29 +239,37 @@ class Bot:
         self.save()
 
     def try_enter(self, market: str, d: dict, sig: st.EntrySignal,
-                  equity: float, avail_inr: float, exposure: float) -> None:
+                  equity: float, avail_inr: float, exposure: float) -> bool:
         t = self.tickers.get(market)
-        if not t or not t.get("ask"):
-            log(f"{market}: no ask price → skip")
-            return
-        ask = float(t["ask"])
+        if not t or not t.get("ask") or not t.get("bid"):
+            log(f"{market}: no bid/ask price → skip")
+            return False
+        ask, bid = float(t["ask"]), float(t["bid"])
         risk_dist = sig.entry_ref - sig.stop
         stop = ask - risk_dist
+        spread_pct = (ask - bid) / ask * 100 if ask > 0 else 100.0
+        if spread_pct > cfg.MAX_SPREAD_PCT:
+            log(f"{market}: signal skipped → spread {spread_pct:.2f}% > {cfg.MAX_SPREAD_PCT:.2f}% "
+                f"(bid {fmt_price(bid)} / ask {fmt_price(ask)})")
+            return False
+        if bid <= stop:
+            log(f"{market}: signal skipped → bid {fmt_price(bid)} already at/below stop {fmt_price(stop)}")
+            return False
         qty, note = size_position(equity, avail_inr, ask, stop, cfg,
                                   float(d.get("min_quantity", 0) or 0),
                                   int(d.get("target_currency_precision", 6)))
         if qty <= 0:
             log(f"{market}: signal skipped → {note}")
-            return
+            return False
         ok, why = market_gate(self.state, market, equity, exposure, qty * ask, cfg)
         if not ok:
             log(f"{market}: signal skipped → {why}")
-            return
-        log(f"{market}: BUY {qty} @ ~₹{ask:,.4f} ({note}) | {sig.reason}")
+            return False
+        log(f"{market}: BUY {qty} @ ~₹{ask:,.4f} ({note}) | spread {spread_pct:.2f}% | {sig.reason}")
         fill = self.broker.buy(market, qty, t, d)
         if not fill:
             log(f"{market}: buy not filled")
-            return
+            return False
         self.state.positions[market] = Position(
             market=market, qty=fill.qty, entry=fill.avg_price,
             stop=fill.avg_price - risk_dist,
@@ -274,6 +283,7 @@ class Bot:
         log(f"{market}: OPEN {fill.qty} @ ₹{fill.avg_price:,.4f} | stop ₹{p.stop:,.4f} "
             f"| target ₹{p.target:,.4f}")
         self.save()
+        return True
 
     # dashboard -------------------------------------------------------------
     def dashboard(self, next_eval: float) -> None:

@@ -59,6 +59,9 @@ EXIT_ON_BEAR_CROSS = _env("EXIT_ON_BEAR_CROSS", True, bool)
 # docs; check https://coindcx.com/fees for your own tier.
 FEE_PCT = _env("FEE_PCT", 0.59, float)
 SLIPPAGE_PCT = _env("SLIPPAGE_PCT", 0.10, float)    # limit price offset past bid/ask
+# Skip entries when the bid/ask spread is wider than this (thin INR books can be 0.5%+),
+# or when the bid is already at/below the stop the moment we would buy.
+MAX_SPREAD_PCT = _env("MAX_SPREAD_PCT", 0.30, float)
 # Skip trades whose target is too small to pay for fees:
 # target distance must be at least MIN_TARGET_FEE_MULT x round-trip fee.
 MIN_TARGET_FEE_MULT = _env("MIN_TARGET_FEE_MULT", 3.0, float)

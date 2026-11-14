@@ -52,3 +52,32 @@ def test_paper_entry_then_stop(tmp_path, monkeypatch):
     rows = open(os.path.join(tmp_path, "trades_paper.csv")).read().strip().splitlines()
     assert len(rows) == 3 and "STOP" in rows[-1]                          # header + buy + sell
     assert os.path.exists(os.path.join(tmp_path, "state_paper.json"))
+
+
+def _bot(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("SHOW_DASHBOARD", "false")
+    import config
+    importlib.reload(config)
+    import day_trading_bot as bot_mod
+    importlib.reload(bot_mod)
+    bot = bot_mod.Bot()
+    bot.client = FakeClient()
+    return bot
+
+
+def test_wide_spread_is_skipped(tmp_path, monkeypatch):
+    bot = _bot(tmp_path, monkeypatch)
+    bot.client.bid, bot.client.ask = 80.10, 80.562          # 0.57% spread, as seen live on DOTINR
+    bot.refresh_tickers()
+    sig = st.EntrySignal(entry_ref=80.468, stop=80.32, target=80.62, reason="test")
+    assert not bot.try_enter("TESTINR", bot.client.markets()["TESTINR"], sig, 100000, 100000, 0)
+    assert not bot.state.positions
+
+
+def test_bid_already_below_stop_is_skipped(tmp_path, monkeypatch):
+    bot = _bot(tmp_path, monkeypatch)
+    bot.client.bid, bot.client.ask = 100.00, 100.20          # 0.2% spread passes the spread check
+    bot.refresh_tickers()
+    sig = st.EntrySignal(entry_ref=100.0, stop=99.90, target=100.2, reason="test")   # stop 0.1 below
+    assert not bot.try_enter("TESTINR", bot.client.markets()["TESTINR"], sig, 100000, 100000, 0)

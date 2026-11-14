@@ -30,6 +30,10 @@ v1 is preserved in `legacy/day_trading_bot_v1.py` and on the `backup/v1-legacy` 
 - Persistent state (`data/state_*.json`), trade log CSV, file logging.
 - Startup reconciliation: positions sold manually are dropped; holdings not opened by the bot are never touched.
 - Signals evaluated right after each candle closes (no drift).
+- Spread check at entry: skip if the bid/ask spread is wider than `MAX_SPREAD_PCT` (0.30%) or the bid
+  is already at/below the stop. Found in a live paper run where DOTINR (0.57% spread) was bought and
+  stopped out 4 seconds later. Dashboard now shows `BUY` vs `SKIP`.
+- Screenshots of every major feature in `docs/screenshots/`, embedded in the README.
 - `backtest.py` portfolio backtester using the same strategy and risk code.
 - Unit tests (`pytest`).
 - `auth_test.py` masks personal details.
